@@ -21,7 +21,6 @@ import (
 
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 )
 
 type SQLiteQueue struct {
@@ -108,7 +107,7 @@ func NewSQLiteQueue(cfg config.SQLiteConfig) *SQLiteQueue {
 		log.Fatal().Err(err).Send()
 	}
 
-	db, err := gorm.Open(sqlite.Open(cfg.Path+"?_journal_mode=WAL&_foreign_keys=off&_auto_vacuum=full"), &gorm.Config{TranslateError: true})
+	db, err := gorm.Open(sqlite.Open(cfg.Path+"?_journal_mode=WAL&_foreign_keys=off&_auto_vacuum=full&_busy_timeout=5000"), &gorm.Config{TranslateError: true})
 	if err != nil {
 		log.Fatal().Err(err).Send()
 	}
@@ -349,74 +348,93 @@ func (q *SQLiteQueue) UpdateMessage(tenantId int64, queue string, messageId int6
 	return nil
 }
 
-// Calculate how many messages to allow the user to dequeue based on queue's rate limit
-func (q *SQLiteQueue) calculateRateLimit(queue *Queue, now int64, numToDequeue int) (int, error) {
-	maxToDequeue := numToDequeue
+// Atomically reserve up to numToDequeue messages from the queue's rate limit
+// and return how many messages may be dequeued right now. The check and the
+// deduction are a single UPDATE statement, so concurrent consumers can never
+// observe the same counter value and collectively exceed the limit.
+func (q *SQLiteQueue) reserveQuota(queue *Queue, now int64, numToDequeue int) (int, error) {
+	if queue.RateLimit <= 0 {
+		return numToDequeue, nil
+	}
+
+	res := q.DBG.Exec(
+		"INSERT INTO rate_limits (tenant_id, queue_id, ts, n) VALUES (?, ?, ?, 0) ON CONFLICT DO NOTHING",
+		queue.TenantID, queue.ID, now,
+	)
+	if res.Error != nil {
+		return 0, res.Error
+	}
+
 	bucketToCheck := now
+	granted := 0
 
 	// If the rate limit is less than 1 per second, meaning 1 message every n seconds
-	if queue.RateLimit > 0 && queue.RateLimit < 1 {
-		// Go back n seconds, check how many messages have been sent in that time period
-
+	if queue.RateLimit < 1 {
 		limitReciprocal := 1.0 / queue.RateLimit
 		earliestBucket := now - int64(limitReciprocal) + 1
-
 		bucketToCheck = earliestBucket
 
-		sql := `
-			SELECT coalesce(cast(sum(n) as real) / (? - min(ts) + 1),0) FROM rate_limits
-			WHERE tenant_id = ? AND queue_id = ? AND ts >= ?
-			`
-
-		res := q.DBG.Raw(sql, now, queue.TenantID, queue.ID, earliestBucket)
+		// Allow a single message if none were dequeued in the current window
+		var n []int64
+		res = q.DBG.Raw(
+			`UPDATE rate_limits SET n = n + 1
+			 WHERE tenant_id = ? AND queue_id = ? AND ts = ?
+			   AND (SELECT coalesce(sum(n), 0) FROM rate_limits
+			        WHERE tenant_id = ? AND queue_id = ? AND ts >= ?) < 1
+			 RETURNING n`,
+			queue.TenantID, queue.ID, now,
+			queue.TenantID, queue.ID, earliestBucket,
+		).Scan(&n)
 		if res.Error != nil {
 			return 0, res.Error
 		}
-
-		var messageRate float64
-
-		rateRes := res.Scan(&messageRate)
-		if rateRes.Error != nil {
-			return 0, rateRes.Error
+		if len(n) > 0 {
+			granted = 1
 		}
+	} else {
+		limit := int64(int(queue.RateLimit))
 
-		if messageRate >= queue.RateLimit {
-			return 0, nil
-		}
-
-		maxToDequeue = 1
-	} else if queue.RateLimit >= 1 {
-		// Check how many messages were sent in current bucket
-		bucket := &RateLimit{}
-		res := q.DBG.Where("tenant_id = ? AND queue_id = ? AND ts = ?", queue.TenantID, queue.ID, now).FirstOrCreate(bucket)
-
-		if res.Error != nil && !errors.Is(res.Error, gorm.ErrDuplicatedKey) {
+		// Increment the bucket first, then grant only the portion of the
+		// increment that falls below the limit. Whatever the counter was
+		// before this statement, no other consumer can claim the same quota.
+		var n []int64
+		res = q.DBG.Raw(
+			`UPDATE rate_limits SET n = n + ?
+			 WHERE tenant_id = ? AND queue_id = ? AND ts = ? AND n < ?
+			 RETURNING n`,
+			numToDequeue, queue.TenantID, queue.ID, now, limit,
+		).Scan(&n)
+		if res.Error != nil {
 			return 0, res.Error
 		}
-
-		if bucket.N >= int(queue.RateLimit) {
-			return 0, nil
-		}
-
-		allowedToDequeue := int(queue.RateLimit) - bucket.N
-		if allowedToDequeue < 0 {
-			allowedToDequeue = 0
-		}
-
-		maxToDequeue = min(numToDequeue, allowedToDequeue)
-		if maxToDequeue <= 0 {
-			return 0, nil
+		if len(n) > 0 {
+			granted = numToDequeue - int(max(n[0]-limit, 0))
+			granted = max(granted, 0)
 		}
 	}
 
-	if queue.RateLimit > 0 {
-		res := q.DBG.Where("tenant_id = ? AND queue_id = ? AND ts < ? - 1", queue.TenantID, queue.ID, bucketToCheck).Delete(&RateLimit{})
-		if res.Error != nil {
-			log.Warn().Int64("tenant_id", queue.TenantID).Int64("queue_id", queue.ID).Int64("ts", bucketToCheck).Msg("Unable to clear previous rate limits")
-		}
+	res = q.DBG.Exec("DELETE FROM rate_limits WHERE tenant_id = ? AND queue_id = ? AND ts < ? - 1", queue.TenantID, queue.ID, bucketToCheck)
+	if res.Error != nil {
+		log.Warn().Int64("tenant_id", queue.TenantID).Int64("queue_id", queue.ID).Int64("ts", bucketToCheck).Msg("Unable to clear previous rate limits")
 	}
 
-	return maxToDequeue, nil
+	return granted, nil
+}
+
+// Return previously reserved quota that ended up not being used, so that
+// messages arriving later in the same window are not blocked.
+func (q *SQLiteQueue) refundQuota(queue *Queue, now int64, n int) {
+	if queue.RateLimit <= 0 || n <= 0 {
+		return
+	}
+
+	res := q.DBG.Exec(
+		"UPDATE rate_limits SET n = max(n - ?, 0) WHERE tenant_id = ? AND queue_id = ? AND ts = ?",
+		n, queue.TenantID, queue.ID, now,
+	)
+	if res.Error != nil {
+		log.Warn().Int64("tenant_id", queue.TenantID).Int64("queue_id", queue.ID).Err(res.Error).Msg("Unable to refund rate limit")
+	}
 }
 
 func (q *SQLiteQueue) Dequeue(tenantId int64, queueName string, numToDequeue int, requeueIn int) ([]*models.Message, error) {
@@ -437,74 +455,60 @@ func (q *SQLiteQueue) Dequeue(tenantId int64, queueName string, numToDequeue int
 
 	now := time.Now().UTC().Unix()
 
-	q.Mu.Lock()
-	defer q.Mu.Unlock()
-
-	maxToDequeue, err := q.calculateRateLimit(queue, now, numToDequeue)
+	maxToDequeue, err := q.reserveQuota(queue, now, numToDequeue)
 	if err != nil {
 		return nil, err
 	}
 
+	if maxToDequeue <= 0 {
+		return nil, nil
+	}
+
+	// Atomically claim up to maxToDequeue messages. Selecting which rows to
+	// update and updating them is a single statement, so concurrent
+	// consumers can never claim the same message.
+	var messageIDs []int64
+	res := q.DBG.Raw(
+		`UPDATE messages
+		 SET tries = tries + 1, delivered_at = ?, deliver_at = ?
+		 WHERE tenant_id = ? AND queue_id = ? AND id IN (
+			SELECT id FROM messages
+			WHERE deliver_at <= ? AND delivered_at <= ? AND (tries < max_tries OR max_tries = -1)
+			  AND tenant_id = ? AND queue_id = ?
+			LIMIT ?
+		 )
+		 RETURNING id`,
+		now, now+int64(visibilityTimeout), tenantId, queue.ID,
+		now, now, tenantId, queue.ID, maxToDequeue,
+	).Scan(&messageIDs)
+
+	if res.Error != nil {
+		q.refundQuota(queue, now, maxToDequeue)
+		return nil, res.Error
+	}
+
+	if len(messageIDs) == 0 {
+		q.refundQuota(queue, now, maxToDequeue)
+		return nil, nil
+	}
+
+	q.refundQuota(queue, now, maxToDequeue-len(messageIDs))
+
 	var messages []Message
 
-	res := q.DBG.Preload("KV").Where(
-		"deliver_at <= ? AND delivered_at <= ? AND (tries < max_tries OR max_tries = -1) AND tenant_id = ? AND queue_id = ?",
-		now, now, tenantId, queue.ID).
-		Limit(maxToDequeue).
+	res = q.DBG.Preload("KV").Where(
+		"tenant_id = ? AND queue_id = ? AND id IN ?",
+		tenantId, queue.ID, messageIDs).
 		Find(&messages)
 
 	if res.Error != nil {
-		return nil, err
-	}
-
-	if len(messages) == 0 {
-		return nil, nil
+		return nil, res.Error
 	}
 
 	rc := make([]*models.Message, len(messages))
 
 	for i, message := range messages {
 		rc[i] = message.ToModel()
-	}
-
-	messageIDs := make([]int64, len(rc))
-	for i, message := range rc {
-		messageIDs[i] = message.ID
-	}
-
-	err = q.DBG.Transaction(func(tx *gorm.DB) error {
-		res = tx.Model(&Message{}).Where("tenant_id = ? AND queue_id = ? AND id in ?", tenantId, queue.ID, messageIDs).
-			UpdateColumns(map[string]any{
-				"tries":        gorm.Expr("tries+1"),
-				"delivered_at": now,
-				"deliver_at":   gorm.Expr("?", now+int64(visibilityTimeout)),
-			})
-
-		if res.Error != nil {
-			return res.Error
-		}
-
-		if queue.RateLimit > 0 {
-			bucket := RateLimit{
-				TenantID: tenantId,
-				QueueID:  queue.ID,
-				Ts:       now,
-				N:        len(messageIDs),
-			}
-			res = tx.Clauses(clause.OnConflict{
-				DoUpdates: clause.Assignments(map[string]interface{}{"n": gorm.Expr("n + ?", len(messageIDs))}),
-			}).Create(&bucket)
-
-			if res.Error != nil && !errors.Is(res.Error, gorm.ErrDuplicatedKey) {
-				return res.Error
-			}
-		}
-
-		return nil
-	})
-
-	if err != nil {
-		return nil, err
 	}
 
 	for _, messageId := range messageIDs {
