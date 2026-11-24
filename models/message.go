@@ -13,6 +13,7 @@ const (
 	MessageStatusQueued   MessageStatus = 1
 	MessageStatusDequeued MessageStatus = 2
 	MessageStatusFailed   MessageStatus = 3
+	MessageStatusDelayed  MessageStatus = 4
 	// MessageStatusPaused   MessageStatus = 3
 	// MessageStatusDeleted  MessageStatus = 4
 )
@@ -25,6 +26,8 @@ func (s MessageStatus) String() string {
 		return "Dequeued"
 	case MessageStatusFailed:
 		return "Failed"
+	case MessageStatusDelayed:
+		return "Delayed"
 	}
 
 	return fmt.Sprintf("%d", s)
@@ -45,9 +48,14 @@ type Message struct {
 
 	Message   []byte `db:"message"`
 	KeyValues map[string]string
+	Delayed   bool
 }
 
 func (m *Message) Status() MessageStatus {
+	if m.Delayed {
+		return MessageStatusDelayed
+	}
+
 	now := time.Now().UTC().Unix()
 
 	if m.Tries == m.MaxTries && now > int64(m.DeliverAt) {

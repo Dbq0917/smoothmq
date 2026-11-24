@@ -29,7 +29,12 @@ type SQLiteQueue struct {
 	DBG      *gorm.DB
 	Mu       *sync.Mutex
 	snow     *snowflake.Node
-	ticker   *time.Ticker
+
+	stop      chan struct{}
+	wake      chan struct{}
+	closeOnce sync.Once
+	closeErr  error
+	wg        sync.WaitGroup
 }
 
 var queueDiskSize = promauto.NewGauge(
@@ -38,6 +43,15 @@ var queueDiskSize = promauto.NewGauge(
 		Help: "Size of queue data on disk",
 	},
 )
+
+var delayedMessagesPromoted = promauto.NewCounter(
+	prometheus.CounterOpts{
+		Name: "queue_delayed_messages_promoted_total",
+		Help: "Delayed messages moved from delayed storage into the ready queue",
+	},
+)
+
+const promoteBatchSize = 1000
 
 type Queue struct {
 	ID                int64   `gorm:"primaryKey;autoIncrement:false"`
@@ -95,6 +109,50 @@ type KV struct {
 	V         string `gorm:"not null"`
 }
 
+type DelayedMessage struct {
+	ID       int64 `gorm:"primaryKey;autoIncrement:false"`
+	TenantID int64 `gorm:"not null"`
+	QueueID  int64 `gorm:"not null;index:idx_delayed_message_queue"`
+
+	DeliverAt int64 `gorm:"not null;index:idx_delayed_message_deliver_at"`
+	Tries     int   `gorm:"not null"`
+	MaxTries  int   `gorm:"not null"`
+
+	Message string `gorm:"not null"`
+
+	KV []DelayedKV `gorm:"foreignKey:TenantID,QueueID,MessageID;references:TenantID,QueueID,ID"`
+}
+
+func (message *DelayedMessage) ToModel() *models.Message {
+	rc := &models.Message{
+		ID:       message.ID,
+		TenantID: message.TenantID,
+		QueueID:  message.QueueID,
+
+		DeliverAt: int(message.DeliverAt),
+		Tries:     message.Tries,
+		MaxTries:  message.MaxTries,
+
+		Message:   []byte(message.Message),
+		KeyValues: make(map[string]string),
+		Delayed:   true,
+	}
+
+	for _, kv := range message.KV {
+		rc.KeyValues[kv.K] = kv.V
+	}
+
+	return rc
+}
+
+type DelayedKV struct {
+	TenantID  int64  `gorm:"not null;index:idx_delayed_kv,priority:1"`
+	QueueID   int64  `gorm:"not null;index:idx_delayed_kv,priority:2"`
+	MessageID int64  `gorm:"not null;index:idx_delayed_kv,priority:3"`
+	K         string `gorm:"not null"`
+	V         string `gorm:"not null"`
+}
+
 type RateLimit struct {
 	TenantID int64 `gorm:"not null;index:idx_ratelimit,priority:1,unique"`
 	QueueID  int64 `gorm:"not null;index:idx_ratelimit,priority:2"`
@@ -133,18 +191,40 @@ func NewSQLiteQueue(cfg config.SQLiteConfig) *SQLiteQueue {
 		log.Fatal().Err(err).Send()
 	}
 
+	err = db.AutoMigrate(&DelayedMessage{})
+	if err != nil {
+		log.Fatal().Err(err).Send()
+	}
+
+	err = db.AutoMigrate(&DelayedKV{})
+	if err != nil {
+		log.Fatal().Err(err).Send()
+	}
+
 	rc := &SQLiteQueue{
 		Filename: cfg.Path,
 		DBG:      db,
 		Mu:       &sync.Mutex{},
 		snow:     snow,
-		ticker:   time.NewTicker(1 * time.Second),
+		stop:     make(chan struct{}),
+		wake:     make(chan struct{}, 1),
 	}
 
+	if err := rc.migrateDelayedMessages(); err != nil {
+		log.Fatal().Err(err).Msg("Unable to migrate delayed messages")
+	}
+
+	rc.wg.Add(2)
 	go func() {
+		defer rc.wg.Done()
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+
 		for {
 			select {
-			case <-rc.ticker.C:
+			case <-rc.stop:
+				return
+			case <-ticker.C:
 				stat, err := os.Stat(rc.Filename)
 				if err == nil {
 					queueDiskSize.Set(float64(stat.Size()))
@@ -153,7 +233,215 @@ func NewSQLiteQueue(cfg config.SQLiteConfig) *SQLiteQueue {
 		}
 	}()
 
+	go func() {
+		defer rc.wg.Done()
+		rc.runDelayedScheduler()
+	}()
+
 	return rc
+}
+
+// migrateDelayedMessages moves messages written by older versions out of the
+// ready queue. Only messages that have never been delivered can be delayed.
+func (q *SQLiteQueue) migrateDelayedMessages() error {
+	q.Mu.Lock()
+	defer q.Mu.Unlock()
+
+	now := time.Now().UTC().Unix()
+
+	return q.DBG.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec(`
+			INSERT OR IGNORE INTO delayed_messages
+				(id, tenant_id, queue_id, deliver_at, tries, max_tries, message)
+			SELECT id, tenant_id, queue_id, deliver_at, tries, max_tries, message
+			FROM messages
+			WHERE delivered_at = 0 AND tries = 0 AND deliver_at > ?
+		`, now).Error; err != nil {
+			return err
+		}
+
+		if err := tx.Exec(`
+			INSERT OR IGNORE INTO delayed_kvs
+				(tenant_id, queue_id, message_id, k, v)
+			SELECT k.tenant_id, k.queue_id, k.message_id, k.k, k.v
+			FROM kvs k
+			JOIN messages m
+				ON m.tenant_id = k.tenant_id
+				AND m.queue_id = k.queue_id
+				AND m.id = k.message_id
+			WHERE m.delivered_at = 0 AND m.tries = 0 AND m.deliver_at > ?
+		`, now).Error; err != nil {
+			return err
+		}
+
+		if err := tx.Exec(`
+			DELETE FROM kvs
+			WHERE EXISTS (
+				SELECT 1 FROM messages m
+				WHERE m.tenant_id = kvs.tenant_id
+					AND m.queue_id = kvs.queue_id
+					AND m.id = kvs.message_id
+					AND m.delivered_at = 0
+					AND m.tries = 0
+					AND m.deliver_at > ?
+			)
+		`, now).Error; err != nil {
+			return err
+		}
+
+		return tx.Exec(`
+			DELETE FROM messages
+			WHERE delivered_at = 0 AND tries = 0 AND deliver_at > ?
+		`, now).Error
+	})
+}
+
+func (q *SQLiteQueue) notifyDelayedScheduler() {
+	select {
+	case q.wake <- struct{}{}:
+	default:
+	}
+}
+
+// runDelayedScheduler uses one timer for the entire queue. The timer always
+// targets the earliest delayed message; messages are never polled one by one.
+func (q *SQLiteQueue) runDelayedScheduler() {
+	timer := time.NewTimer(time.Hour)
+	if !timer.Stop() {
+		<-timer.C
+	}
+	defer timer.Stop()
+
+	for {
+		promoteFailed := false
+		for {
+			promoted, err := q.promoteDueDelayedMessages(time.Now().UTC().Unix())
+			if err != nil {
+				log.Error().Err(err).Msg("Unable to promote delayed messages")
+				promoteFailed = true
+				break
+			}
+
+			if promoted < promoteBatchSize {
+				break
+			}
+		}
+
+		nextDeliverAt, hasNext, err := q.nextDelayedDeliverAt()
+
+		var timerC <-chan time.Time
+		if promoteFailed {
+			timer.Reset(time.Second)
+			timerC = timer.C
+		} else if err != nil {
+			log.Error().Err(err).Msg("Unable to find next delayed message")
+			timer.Reset(time.Second)
+			timerC = timer.C
+		} else if hasNext {
+			wait := time.Until(time.Unix(nextDeliverAt, 0))
+			if wait < 0 {
+				wait = 0
+			}
+
+			timer.Reset(wait)
+			timerC = timer.C
+		}
+
+		select {
+		case <-q.stop:
+			return
+		case <-q.wake:
+		case <-timerC:
+		}
+
+		if timerC != nil && !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+	}
+}
+
+func (q *SQLiteQueue) nextDelayedDeliverAt() (int64, bool, error) {
+	var result struct {
+		DeliverAt *int64
+	}
+
+	res := q.DBG.Raw("SELECT MIN(deliver_at) AS deliver_at FROM delayed_messages").Scan(&result)
+	if res.Error != nil {
+		return 0, false, res.Error
+	}
+
+	if result.DeliverAt == nil {
+		return 0, false, nil
+	}
+
+	return *result.DeliverAt, true, nil
+}
+
+func (q *SQLiteQueue) promoteDueDelayedMessages(now int64) (int, error) {
+	q.Mu.Lock()
+	defer q.Mu.Unlock()
+
+	var messageIDs []int64
+	res := q.DBG.Model(&DelayedMessage{}).
+		Where("deliver_at <= ?", now).
+		Order("deliver_at").
+		Limit(promoteBatchSize).
+		Pluck("id", &messageIDs)
+	if res.Error != nil {
+		return 0, res.Error
+	}
+
+	if len(messageIDs) == 0 {
+		return 0, nil
+	}
+
+	promoted := 0
+	err := q.DBG.Transaction(func(tx *gorm.DB) error {
+		res := tx.Exec(`
+			INSERT INTO messages
+				(id, tenant_id, queue_id, deliver_at, delivered_at, tries, max_tries, message)
+			SELECT id, tenant_id, queue_id, deliver_at, 0, tries, max_tries, message
+			FROM delayed_messages
+			WHERE id IN ?
+		`, messageIDs)
+		if res.Error != nil {
+			return res.Error
+		}
+		promoted = int(res.RowsAffected)
+
+		if err := tx.Exec(`
+			INSERT INTO kvs
+				(tenant_id, queue_id, message_id, k, v)
+			SELECT tenant_id, queue_id, message_id, k, v
+			FROM delayed_kvs
+			WHERE message_id IN ?
+		`, messageIDs).Error; err != nil {
+			return err
+		}
+
+		if err := tx.Exec(`
+			DELETE FROM delayed_kvs WHERE message_id IN ?
+		`, messageIDs).Error; err != nil {
+			return err
+		}
+
+		return tx.Exec(`
+			DELETE FROM delayed_messages WHERE id IN ?
+		`, messageIDs).Error
+	})
+	if err != nil {
+		return 0, err
+	}
+
+	delayedMessagesPromoted.Add(float64(promoted))
+	for _, messageID := range messageIDs {
+		log.Debug().Int64("message_id", messageID).Msg("Promoted delayed message")
+	}
+
+	return promoted, nil
 }
 
 func (q *SQLiteQueue) CreateQueue(tenantId int64, properties models.QueueProperties) error {
@@ -246,7 +534,15 @@ func (q *SQLiteQueue) DeleteQueue(tenantId int64, queueName string) error {
 			return err
 		}
 
+		if err := tx.Where("tenant_id = ? AND queue_id = ?", tenantId, queue.ID).Delete(&DelayedKV{}).Error; err != nil {
+			return err
+		}
+
 		if err := tx.Where("tenant_id = ? AND queue_id = ?", tenantId, queue.ID).Delete(&Message{}).Error; err != nil {
+			return err
+		}
+
+		if err := tx.Where("tenant_id = ? AND queue_id = ?", tenantId, queue.ID).Delete(&DelayedMessage{}).Error; err != nil {
 			return err
 		}
 
@@ -296,6 +592,40 @@ func (q *SQLiteQueue) Enqueue(tenantId int64, queueName string, message string, 
 	now := time.Now().UTC().Unix()
 	deliverAt := now + int64(delay)
 
+	q.Mu.Lock()
+	defer q.Mu.Unlock()
+
+	if delay > 0 {
+		delayed := &DelayedMessage{
+			ID:        messageId,
+			TenantID:  tenantId,
+			QueueID:   queue.ID,
+			DeliverAt: deliverAt,
+			MaxTries:  queue.MaxRetries,
+			Message:   message,
+			KV:        make([]DelayedKV, 0, len(kv)),
+		}
+
+		for k, v := range kv {
+			delayed.KV = append(delayed.KV, DelayedKV{
+				TenantID:  tenantId,
+				MessageID: messageId,
+				QueueID:   queue.ID,
+				K:         k,
+				V:         v,
+			})
+		}
+
+		if err := q.DBG.Create(delayed).Error; err != nil {
+			return 0, err
+		}
+
+		q.notifyDelayedScheduler()
+		log.Debug().Int64("message_id", messageId).Int64("deliver_at", deliverAt).Msg("Stored delayed message")
+
+		return messageId, nil
+	}
+
 	newMessage := &Message{
 		ID:          messageId,
 		TenantID:    tenantId,
@@ -304,23 +634,18 @@ func (q *SQLiteQueue) Enqueue(tenantId int64, queueName string, message string, 
 		DeliveredAt: 0,
 		MaxTries:    queue.MaxRetries,
 		Message:     message,
-
-		KV: make([]KV, 0),
+		KV:          make([]KV, 0, len(kv)),
 	}
 
 	for k, v := range kv {
-		newKv := KV{
+		newMessage.KV = append(newMessage.KV, KV{
 			TenantID:  tenantId,
 			MessageID: messageId,
 			QueueID:   queue.ID,
 			K:         k,
 			V:         v,
-		}
-		newMessage.KV = append(newMessage.KV, newKv)
+		})
 	}
-
-	q.Mu.Lock()
-	defer q.Mu.Unlock()
 
 	if err := q.DBG.Create(newMessage).Error; err != nil {
 		return 0, err
@@ -527,11 +852,25 @@ func (q *SQLiteQueue) Peek(tenantId int64, queueName string, messageId int64) *m
 		tenantId, queue.ID, messageId).
 		First(message)
 
+	if res.Error == nil {
+		return message.ToModel()
+	}
+
+	if !errors.Is(res.Error, gorm.ErrRecordNotFound) {
+		return nil
+	}
+
+	delayed := &DelayedMessage{}
+	res = q.DBG.Preload("KV").Where(
+		"tenant_id = ? AND queue_id = ? AND id = ?",
+		tenantId, queue.ID, messageId).
+		First(delayed)
+
 	if res.Error != nil {
 		return nil
 	}
 
-	return message.ToModel()
+	return delayed.ToModel()
 }
 
 func (q *SQLiteQueue) Stats(tenantId int64, queueName string) models.QueueStats {
@@ -543,15 +882,19 @@ func (q *SQLiteQueue) Stats(tenantId int64, queueName string) models.QueueStats 
 	now := time.Now().UTC().Unix()
 
 	res := q.DBG.Raw(`
-		SELECT
-		CASE
-			WHEN tries = max_tries AND deliver_at < ? THEN 3
-			WHEN delivered_at <= ? AND deliver_at > ? THEN 2
-			ELSE 1
-		END AS s,
-		count(*) FROM messages WHERE queue_id=? AND tenant_id=? GROUP BY s
+		SELECT s, count(*) FROM (
+			SELECT
+			CASE
+				WHEN tries = max_tries AND deliver_at < ? THEN 3
+				WHEN delivered_at <= ? AND deliver_at > ? THEN 2
+				ELSE 1
+			END AS s
+			FROM messages WHERE queue_id=? AND tenant_id=?
+			UNION ALL
+			SELECT 4 AS s FROM delayed_messages WHERE queue_id=? AND tenant_id=?
+		) GROUP BY s
 	`, now, now, now,
-		queue.ID, tenantId,
+		queue.ID, tenantId, queue.ID, tenantId,
 	)
 
 	if res.Error != nil {
@@ -591,43 +934,41 @@ func (q *SQLiteQueue) Filter(tenantId int64, queueName string, filterCriteria mo
 		return nil
 	}
 
-	args := make([]any, 0)
-	args = append(args, tenantId)
-	args = append(args, queue.ID)
-
-	sql := "SELECT id FROM messages WHERE tenant_id=? AND queue_id=? "
+	criteria := "tenant_id = ? AND queue_id = ?"
+	args := []any{tenantId, queue.ID}
 
 	if filterCriteria.MessageID > 0 {
-		sql += " AND id = ? "
+		criteria += " AND id = ?"
 		args = append(args, filterCriteria.MessageID)
 	}
 
 	if len(filterCriteria.KV) > 0 {
-		sql += " AND "
-		sql += " id IN (SELECT message_id FROM kvs WHERE ("
+		criteria += " AND id IN (SELECT message_id FROM ("
+		criteria += "SELECT tenant_id, queue_id, message_id, k, v FROM kvs"
+		criteria += " UNION ALL "
+		criteria += "SELECT tenant_id, queue_id, message_id, k, v FROM delayed_kvs"
+		criteria += ") AS message_kv WHERE ("
 
-		for i := range len(filterCriteria.KV) {
-			sql += "(k=? AND v=? and tenant_id=? and queue_id=?)"
-
-			if i < len(filterCriteria.KV)-1 {
-				sql += " OR "
+		i := 0
+		for k, v := range filterCriteria.KV {
+			if i > 0 {
+				criteria += " OR "
 			}
+			criteria += "(k = ? AND v = ? AND tenant_id = ? AND queue_id = ?)"
+			args = append(args, k, v, tenantId, queue.ID)
+			i++
 		}
 
-		sql += " ) GROUP BY message_id HAVING count(*) = ? LIMIT 10"
-		sql += " ) "
-
+		criteria += ") GROUP BY message_id HAVING count(*) = ? LIMIT 10)"
+		args = append(args, len(filterCriteria.KV))
 	}
 
-	for k, v := range filterCriteria.KV {
-		args = append(args, k, v, tenantId, queue.ID)
-	}
+	sql := "SELECT id FROM (SELECT id FROM messages WHERE " + criteria +
+		" UNION ALL SELECT id FROM delayed_messages WHERE " + criteria +
+		") AS message_ids ORDER BY id LIMIT 10"
+	queryArgs := append(append([]any{}, args...), args...)
 
-	args = append(args, len(filterCriteria.KV))
-
-	sql += "LIMIT 10"
-
-	res := q.DBG.Raw(sql, args...).Scan(&rc)
+	res := q.DBG.Raw(sql, queryArgs...).Scan(&rc)
 	if res.Error != nil {
 		log.Error().Err(res.Error).Msg("Unable to filter")
 	}
@@ -649,7 +990,15 @@ func (q *SQLiteQueue) Delete(tenantId int64, queueName string, messageId int64) 
 			return err
 		}
 
+		if err := tx.Where("tenant_id = ? AND queue_id = ? AND message_id = ?", tenantId, queue.ID, messageId).Delete(&DelayedKV{}).Error; err != nil {
+			return err
+		}
+
 		if err := tx.Where("tenant_id = ? AND queue_id = ? AND id = ?", tenantId, queue.ID, messageId).Delete(&Message{}).Error; err != nil {
+			return err
+		}
+
+		if err := tx.Where("tenant_id = ? AND queue_id = ? AND id = ?", tenantId, queue.ID, messageId).Delete(&DelayedMessage{}).Error; err != nil {
 			return err
 		}
 
@@ -664,10 +1013,18 @@ func (q *SQLiteQueue) Delete(tenantId int64, queueName string, messageId int64) 
 }
 
 func (q *SQLiteQueue) Shutdown() error {
-	db, err := q.DBG.DB()
-	if err != nil {
-		return err
-	}
+	q.closeOnce.Do(func() {
+		close(q.stop)
+		q.wg.Wait()
 
-	return db.Close()
+		db, err := q.DBG.DB()
+		if err != nil {
+			q.closeErr = err
+			return
+		}
+
+		q.closeErr = db.Close()
+	})
+
+	return q.closeErr
 }

@@ -211,9 +211,17 @@ func (s *SQS) PurgeQueue(c *fiber.Ctx, tenantId int64) error {
 	tokens := strings.Split(req.QueueUrl, "/")
 	queue := tokens[len(tokens)-1]
 
-	messages := s.queue.Filter(tenantId, queue, models.FilterCriteria{})
-	for _, msg := range messages {
-		s.queue.Delete(tenantId, queue, msg)
+	for {
+		messages := s.queue.Filter(tenantId, queue, models.FilterCriteria{})
+		if len(messages) == 0 {
+			break
+		}
+
+		for _, msg := range messages {
+			if err := s.queue.Delete(tenantId, queue, msg); err != nil {
+				return err
+			}
+		}
 	}
 
 	rc := PurgeQueueResponse{
